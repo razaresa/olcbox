@@ -46,6 +46,13 @@ data class LocationConfig(
 
     fun isComplete(): Boolean = id.isNotBlank() && key.isNotBlank()
 
+    fun roomCandidates(): List<String> {
+        return id.split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+    }
+
     fun displayName(): String = name.ifBlank { id }
 
     fun providerName(): String = providerDisplayName(bypassProvider)

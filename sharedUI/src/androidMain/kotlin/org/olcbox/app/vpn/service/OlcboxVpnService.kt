@@ -41,11 +41,14 @@ import org.olcbox.app.data.repository.LocationsRepository
 import org.olcbox.app.vpn.AndroidConnectionMode
 import org.olcbox.app.vpn.AndroidSocksProxySettings
 import org.olcbox.app.vpn.AndroidSplitTunnelMode
+import org.olcbox.app.vpn.JitsiRoomFailoverSelector
 import org.olcbox.app.vpn.RtcLogEvent
 import org.olcbox.app.vpn.RtcLogRecoveryClassifier
+import org.olcbox.app.vpn.RtcStartupRetryPolicy
 import org.olcbox.app.vpn.UpstreamCandidate
 import org.olcbox.app.vpn.UpstreamNetworkSelector
 import org.olcbox.app.vpn.UpstreamTransport
+import org.olcbox.app.vpn.VpnRoutePolicy
 import org.olcbox.app.vpn.VpnStatus
 import org.olcbox.app.vpn.data.KEY_ANDROID_CONNECTION_MODE
 import org.olcbox.app.vpn.data.KEY_ANDROID_SPLIT_TUNNEL_BYPASS_APPS
@@ -85,6 +88,8 @@ class OlcboxVpnService : VpnService() {
     private var watchdogTunStats: Tun2SocksStats? = null
     private var watchdogStalledSamples = 0
     private var lastWakeLockRefreshAtMs = 0L
+    private val jitsiRoomFailoverSelector = JitsiRoomFailoverSelector()
+    private var advanceJitsiRoomOnNextStart = false
     @Volatile
     private var lastRtcConnectedAtMs = 0L
     @Volatile
@@ -339,6 +344,8 @@ class OlcboxVpnService : VpnService() {
         watchdogJob?.cancel()
         if (!isMigration) {
             recoveryRequestedForGeneration = 0L
+            advanceJitsiRoomOnNextStart = false
+            jitsiRoomFailoverSelector.reset()
         }
         val requestedGeneration = ++generation
 
@@ -435,12 +442,18 @@ class OlcboxVpnService : VpnService() {
         }
         updateUnderlyingNetwork(upstream)
 
-        if (!startMobile(location, upstream, setErrorOnFailure = !isMigration)) {
-            if (isMigration) {
+        val canFailoverJitsiRoom = jitsiRoomFailoverSelector.canFailover(location)
+        if (!startMobile(location, upstream, setErrorOnFailure = !isMigration && !canFailoverJitsiRoom)) {
+            if (isMigration || canFailoverJitsiRoom) {
                 updateUnderlyingNetwork(null)
                 setStatus(VpnStatus.Reconnecting)
                 updateNotification("Waiting for transport...")
-                scheduleTransportRetry(requestedGeneration, "transport start failed", RECONNECT_RETRY_DELAY_MS)
+                val reason = if (canFailoverJitsiRoom) {
+                    "Jitsi room failed"
+                } else {
+                    "transport start failed"
+                }
+                scheduleTransportRetry(requestedGeneration, reason, RECONNECT_RETRY_DELAY_MS)
             }
             return
         }
@@ -493,46 +506,69 @@ class OlcboxVpnService : VpnService() {
     ): Boolean {
         val keepProcessBound = shouldKeepProcessBound(upstream)
         val config = location.normalized()
+        val targetSocksPort = socksListenPort
+        var startConfig = selectJitsiRoomCandidate(config)
         return try {
-            installMobileCallbacks()
-            val targetSocksPort = socksListenPort
-            resetRtcHealthState()
+            for (attempt in 1..MOBILE_START_MAX_ATTEMPTS) {
+                try {
+                    installMobileCallbacks()
+                    resetRtcHealthState()
 
-            waitForSocksPortReleased(targetSocksPort, SOCKS_RELEASE_QUICK_TIMEOUT_MS)
-            if (isLocalSocksPortOpen(targetSocksPort)) {
-                throw IllegalStateException("SOCKS port $targetSocksPort is still in use")
-            }
-            bindProcessToNetwork(upstream, "Bound to ${getNetName(upstream)}")
-            configureMobileTransport(config)
-            addLog(
-                "Starting olcRTC provider=${config.bypassProvider}, " +
-                    "transport=${config.transport}, room=${config.id}"
-            )
-            Mobile.startWithTransport(
-                config.bypassProvider,
-                config.transport,
-                config.id,
-                config.clientId,
-                config.key,
-                targetSocksPort.toLong(),
-                socksUsername,
-                socksPassword
-            )
-            Mobile.waitReady(MOBILE_READY_TIMEOUT_MS)
-            addLog("olcRTC ready on 127.0.0.1:$targetSocksPort")
-            addLog("username: $socksUsername, password: $socksPassword")
-            markRtcConnected()
-            if (keepProcessBound) {
-                addLog("Keeping olcRTC bound to ${getNetName(upstream)}")
-            }
-            true
-        } catch (e: Exception) {
-            addLog("olcRTC start failed: ${e.message}")
-            unbindProcessFromNetwork()
-            stopMobileAndWait()
-            if (setErrorOnFailure) {
-                setStatus(VpnStatus.Error(e.message ?: "Transport failed"))
-                updateNotification("Connection failed")
+                    waitForSocksPortReleased(targetSocksPort, SOCKS_RELEASE_QUICK_TIMEOUT_MS)
+                    if (isLocalSocksPortOpen(targetSocksPort)) {
+                        throw IllegalStateException("SOCKS port $targetSocksPort is still in use")
+                    }
+                    bindProcessToNetwork(upstream, "Bound to ${getNetName(upstream)}")
+                    configureMobileTransport(startConfig)
+                    addLog(
+                        "Starting olcRTC provider=${startConfig.bypassProvider}, " +
+                            "transport=${startConfig.transport}, room=${startConfig.id}"
+                    )
+                    Mobile.startWithTransport(
+                        startConfig.bypassProvider,
+                        startConfig.transport,
+                        startConfig.id,
+                        startConfig.clientId,
+                        startConfig.key,
+                        targetSocksPort.toLong(),
+                        socksUsername,
+                        socksPassword
+                    )
+                    Mobile.waitReady(MOBILE_READY_TIMEOUT_MS)
+                    addLog("olcRTC ready on 127.0.0.1:$targetSocksPort")
+                    addLog("username: $socksUsername, password: $socksPassword")
+                    markRtcConnected()
+                    if (keepProcessBound) {
+                        addLog("Keeping olcRTC bound to ${getNetName(upstream)}")
+                    }
+                    return true
+                } catch (e: Exception) {
+                    val message = e.message ?: "Transport failed"
+                    if (RtcStartupRetryPolicy.shouldRetry(
+                            message = message,
+                            attempt = attempt,
+                            maxAttempts = MOBILE_START_MAX_ATTEMPTS
+                        )
+                    ) {
+                        addLog("olcRTC transient start failure: $message; retrying")
+                        unbindProcessFromNetwork()
+                        stopMobileAndWait()
+                        delay(MOBILE_START_RETRY_DELAY_MS)
+                        continue
+                    }
+
+                    addLog("olcRTC start failed: $message")
+                    if (markJitsiRoomCandidateFailed(config)) {
+                        addLog("Jitsi failover: will try next room")
+                    }
+                    unbindProcessFromNetwork()
+                    stopMobileAndWait()
+                    if (setErrorOnFailure) {
+                        setStatus(VpnStatus.Error(message))
+                        updateNotification("Connection failed")
+                    }
+                    return false
+                }
             }
             false
         } finally {
@@ -545,7 +581,6 @@ class OlcboxVpnService : VpnService() {
     private fun configureMobileTransport(location: LocationConfig) {
         val config = location.normalized()
         Mobile.setProviders()
-        Mobile.setLink("direct")
         Mobile.setTransport(config.transport)
         Mobile.setDNS("1.1.1.1:53")
         Mobile.setVP8Options(config.vp8Fps.toLong(), config.vp8Batch.toLong())
@@ -597,13 +632,17 @@ class OlcboxVpnService : VpnService() {
                 .setSession("Olcbox VPN")
                 .setMtu(TUN_MTU)
                 .addAddress(TUN_IPV4_ADDRESS, IPV4_PREFIX_LENGTH)
-                .addRoute("0.0.0.0", 0)
                 .addDnsServer(MAPDNS_ADDRESS)
                 .setBlocking(true)
+
+            VpnRoutePolicy.publicIpv4RoutesExcludingPrivateLan.forEach { route ->
+                builder.addRoute(route.address, route.prefixLength)
+            }
 
             if (!applySplitTunneling(builder)) return null
 
             currentNetwork?.let { builder.setUnderlyingNetworks(arrayOf(it)) }
+            addLog("VPN routes: public IPv4 through TUN; private LAN bypassed")
             builder.establish()
         } catch (e: Exception) {
             addLog("VPN establish failed: ${e.message}")
@@ -906,6 +945,20 @@ class OlcboxVpnService : VpnService() {
         }
     }
 
+    private fun selectJitsiRoomCandidate(config: LocationConfig): LocationConfig {
+        if (advanceJitsiRoomOnNextStart) {
+            advanceJitsiRoomOnNextStart = false
+            if (jitsiRoomFailoverSelector.advance(config)) {
+                addLog("Jitsi failover: switching room")
+            }
+        }
+        return jitsiRoomFailoverSelector.select(config)
+    }
+
+    private fun markJitsiRoomCandidateFailed(config: LocationConfig): Boolean {
+        return jitsiRoomFailoverSelector.advance(config)
+    }
+
     private fun markRtcConnected() {
         lastRtcConnectedAtMs = System.currentTimeMillis()
         lastRtcFailureAtMs = 0L
@@ -984,6 +1037,7 @@ class OlcboxVpnService : VpnService() {
         if (recoveryRequestedForGeneration == recoveryGeneration) return
 
         recoveryRequestedForGeneration = recoveryGeneration
+        advanceJitsiRoomOnNextStart = true
         setStatus(VpnStatus.Reconnecting)
         updateNotification("Reconnecting...")
         addLog("$reason; reconnecting transport")
@@ -1381,6 +1435,8 @@ class OlcboxVpnService : VpnService() {
 
         private const val LOCAL_SOCKS_PORT_BASE = 10818
         private const val LOCAL_SOCKS_PORT_MAX = 10858
+        private const val MOBILE_START_MAX_ATTEMPTS = 2
+        private const val MOBILE_START_RETRY_DELAY_MS = 500L
         private const val MOBILE_READY_TIMEOUT_MS = 25_000L
         private const val RTC_LIVENESS_INTERVAL_MS = 30_000L
         private const val RTC_LIVENESS_TIMEOUT_MS = 15_000L

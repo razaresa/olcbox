@@ -190,6 +190,25 @@ class LocationsRepositoryImplTest {
     }
 
     @Test
+    fun importsJitsiDatachannelOlcRtcUriWithFailoverRooms() = runTest {
+        val source = FakeLocationsDataSource()
+        val primary = "https://meet.cryptopro.ru/olcrtc-razares-jitsi-20260516"
+        val backup = "https://jitsi.etudevs.ru/olcrtc-razares-jitsi-20260516"
+        val input = "olcrtc://jitsi?datachannel@$primary,$backup#${"c".repeat(64)}${'$'}razares-jitsi"
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        val location = imported.locations.single().location
+        assertEquals(LocationConfig.PROVIDER_JITSI, location.bypassProvider)
+        assertEquals(LocationConfig.TRANSPORT_DATACHANNEL, location.transport)
+        assertEquals("$primary,$backup", location.id)
+        assertEquals(listOf(primary, backup), location.roomCandidates())
+        assertEquals("razares-jitsi", location.name)
+    }
+
+    @Test
     fun importsOlcRtcSubscriptionAndAppliesLocalNames() = runTest {
         val source = FakeLocationsDataSource()
         val input = """

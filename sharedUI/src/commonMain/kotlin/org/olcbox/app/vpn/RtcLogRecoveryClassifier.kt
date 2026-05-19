@@ -61,6 +61,14 @@ internal object RtcLogRecoveryClassifier {
             )
         }
 
+        if (lowerLine.contains("client control stream ended")) {
+            return RtcLogEvent.Failure(
+                reason = "RTC control stream ended",
+                recreateTunnel = false,
+                threshold = 1
+            )
+        }
+
         if (lowerLine.contains("server reconnect")) {
             return RtcLogEvent.Failure(
                 reason = "RTC server requested reconnect",
@@ -101,9 +109,7 @@ internal object RtcLogRecoveryClassifier {
 
         if (lowerLine.contains("network is unreachable") ||
             lowerLine.contains("use of closed network connection") ||
-            lowerLine.contains("read/write on closed pipe") ||
-            lowerLine.contains("remote not ready") ||
-            lowerLine.contains("read_err=eof")
+            lowerLine.contains("read/write on closed pipe")
         ) {
             return RtcLogEvent.Failure(
                 reason = "RTC network path is closed",

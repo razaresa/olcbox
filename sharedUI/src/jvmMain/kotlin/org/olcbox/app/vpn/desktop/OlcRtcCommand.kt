@@ -27,19 +27,26 @@ internal data class OlcRtcCommand(
     fun configYaml(): String {
         val config = location.normalized()
         val provider = desktopProviderArg(config.bypassProvider)
+        val roomCandidates = config.roomCandidates()
+        val useFailoverProfiles = config.bypassProvider == LocationConfig.PROVIDER_JITSI &&
+            roomCandidates.size > 1
         val dataPath = dataDir ?: configFile.parent ?: Path(".")
         val builder = StringBuilder()
 
         builder.appendLine("mode: cnc")
         builder.appendLine("link: direct")
-        builder.appendLine("auth:")
-        builder.appendLine("  provider: $provider")
-        builder.appendLine("room:")
-        builder.appendLine("  id: ${yamlScalar(config.id)}")
+        if (!useFailoverProfiles) {
+            builder.appendLine("auth:")
+            builder.appendLine("  provider: $provider")
+            builder.appendLine("room:")
+            builder.appendLine("  id: ${yamlScalar(config.id)}")
+        }
         builder.appendLine("crypto:")
         builder.appendLine("  key: ${yamlScalar(config.key)}")
         builder.appendLine("net:")
-        builder.appendLine("  transport: ${config.transport}")
+        if (!useFailoverProfiles) {
+            builder.appendLine("  transport: ${config.transport}")
+        }
         builder.appendLine("  dns: '1.1.1.1:53'")
         builder.appendLine("socks:")
         builder.appendLine("  host: ${yamlScalar(socksHost)}")
@@ -68,6 +75,21 @@ internal data class OlcRtcCommand(
 
         builder.appendLine("data: ${yamlScalar(dataPath.toString())}")
         builder.appendLine("debug: false")
+        if (useFailoverProfiles) {
+            builder.appendLine("profiles:")
+            roomCandidates.forEachIndexed { index, room ->
+                builder.appendLine("  - name: jitsi-${index + 1}")
+                builder.appendLine("    auth:")
+                builder.appendLine("      provider: $provider")
+                builder.appendLine("    room:")
+                builder.appendLine("      id: ${yamlScalar(room)}")
+                builder.appendLine("    net:")
+                builder.appendLine("      transport: ${config.transport}")
+            }
+            builder.appendLine("failover:")
+            builder.appendLine("  retry_delay: 2s")
+            builder.appendLine("  max_cycles: 0")
+        }
         return builder.toString()
     }
 

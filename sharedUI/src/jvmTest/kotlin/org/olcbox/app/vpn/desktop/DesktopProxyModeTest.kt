@@ -113,6 +113,37 @@ class DesktopProxyModeTest {
     }
 
     @Test
+    fun olcRtcCommandWritesJitsiFailoverProfilesForMultipleRooms() {
+        val primary = "https://meet.cryptopro.ru/olcrtc-room"
+        val backup = "https://jitsi.etudevs.ru/olcrtc-room"
+        val command = OlcRtcCommand(
+            binary = Path.of("/tmp/olcrtc"),
+            location = LocationConfig(
+                name = "Jitsi",
+                id = "$primary,$backup",
+                key = "b".repeat(64),
+                bypassProvider = LocationConfig.PROVIDER_JITSI,
+                transport = LocationConfig.TRANSPORT_DATACHANNEL
+            ),
+            configFile = Path.of("/tmp/olcbox-client.yaml")
+        )
+
+        val yaml = command.configYaml()
+
+        assertContains(yaml, "profiles:")
+        assertContains(yaml, "  - name: jitsi-1")
+        assertContains(yaml, "      provider: jitsi")
+        assertContains(yaml, "      id: '$primary'")
+        assertContains(yaml, "      transport: datachannel")
+        assertContains(yaml, "  - name: jitsi-2")
+        assertContains(yaml, "      id: '$backup'")
+        assertContains(yaml, "failover:")
+        assertContains(yaml, "  retry_delay: 2s")
+        assertContains(yaml, "  max_cycles: 0")
+        assertTrue("id: '$primary,$backup'" !in yaml)
+    }
+
+    @Test
     fun olcRtcCommandAddsTransportSpecificYamlOnlyWhenNeeded() {
         LocationConfig.supportedBypassProviders.forEach { provider ->
             val command = OlcRtcCommand(

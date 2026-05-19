@@ -89,6 +89,27 @@ class RtcLogRecoveryClassifierTest {
     }
 
     @Test
+    fun treatsClientControlStreamEndAsRecoverableLivenessFailure() {
+        assertEquals(
+            RtcLogEvent.Failure(
+                reason = "RTC control stream ended",
+                recreateTunnel = false,
+                threshold = 1
+            ),
+            RtcLogRecoveryClassifier.classify("client control stream ended: read control hdr: EOF")
+        )
+    }
+
+    @Test
+    fun ignoresPerStreamRemoteNotReadyFailures() {
+        assertNull(
+            RtcLogRecoveryClassifier.classify(
+                "sid=17 connect failed: sid=17: remote not ready (read_err=EOF ack=[0])"
+            )
+        )
+    }
+
+    @Test
     fun ignoresTrafficLines() {
         assertNull(
             RtcLogRecoveryClassifier.classify(
